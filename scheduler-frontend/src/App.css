@@ -1,0 +1,18 @@
+body {
+  font-family: "Roboto", sans-serif;
+  background-color: #f5f5f5;
+  margin: 0;
+  padding: 0;
+}
+
+h1, h2, h6 {
+  color: #333;
+}
+
+table {
+  width: 100%;
+}
+
+.MuiTableRow-root:hover {
+  background-color: #f0f0f0;
+}

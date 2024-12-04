@@ -92,6 +92,51 @@ async def process_emails():
     result = await email_handler.remote()
     return {"message": result}
 
+@app.get("/meetings")
+def get_meetings():
+    """Fetch all meetings."""
+    try:
+        conn = sqlite3.connect('scheduler.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM meetings')
+        meetings = cursor.fetchall()
+        conn.close()
+        return {"meetings": meetings}
+    except Exception as e:
+        logger.error(f"Error fetching meetings: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching meetings.")
+
+@app.get("/feedback")
+def get_feedback():
+    """Fetch all feedback."""
+    try:
+        conn = sqlite3.connect('scheduler.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM feedback')
+        feedback = cursor.fetchall()
+        conn.close()
+        return {"feedback": feedback}
+    except Exception as e:
+        logger.error(f"Error fetching feedback: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching feedback.")
+
+@app.get("/meeting/{meeting_id}")
+def get_meeting_details(meeting_id: int):
+    """Fetch details of a specific meeting."""
+    try:
+        conn = sqlite3.connect('scheduler.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM meetings WHERE id = ?', (meeting_id,))
+        meeting = cursor.fetchone()
+        cursor.execute('SELECT * FROM feedback WHERE meeting_id = ?', (meeting_id,))
+        feedback = cursor.fetchall()
+        conn.close()
+        return {"meeting": meeting, "feedback": feedback}
+    except Exception as e:
+        logger.error(f"Error fetching meeting details: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching meeting details.")
+
+
 # Background Email Processing
 def email_processing_loop():
     """Loop to process emails every 5 minutes."""
