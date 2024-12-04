@@ -14,6 +14,10 @@ import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
+# agents.py
+
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 import threading
 
 load_dotenv()
@@ -30,7 +34,8 @@ openai_api_key = os.getenv('OPENAI_API_KEY')
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
-    'https://www.googleapis.com/auth/gmail.modify'  # Added to allow modifying emails
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/calendar'
 ]
 
 def parse_natural_language(text):
@@ -61,6 +66,29 @@ def parse_natural_language(text):
         logger.error(f"Error parsing natural language: {e}")
         return "{}"
 
+def create_google_calendar_event(creds, title, date, time, attendees):
+    """Create an event in Google Calendar."""
+    try:
+        service = build('calendar', 'v3', credentials=creds)
+        event = {
+            'summary': title,
+            'start': {
+                'dateTime': f'{date}T{time}:00',
+                'timeZone': 'UTC',
+            },
+            'end': {
+                'dateTime': f'{date}T{int(time[:2]) + 1}:{time[3:]}:00',  # End time 1 hour later
+                'timeZone': 'UTC',
+            },
+            'attendees': [{'email': attendee} for attendee in attendees.split(',')],
+        }
+        event_result = service.events().insert(calendarId='primary', body=event).execute()
+        logger.info(f"Event created: {event_result['summary']}")
+        return event_result
+    except HttpError as error:
+        logger.error(f"Error creating event: {error}")
+        return None
+
 @ray.remote
 def schedule_meeting(text):
     parsed = parse_natural_language(text)
@@ -70,6 +98,7 @@ def schedule_meeting(text):
         if intent != 'schedule':
             logger.warning(f"Unrecognized intent: {intent}. Email will not be sent.")
             return f"Intent '{intent}' not recognized for scheduling. No email sent."
+        
         title = data.get('title', 'Meeting')
         date = data['date']
         time = data['time']
@@ -85,8 +114,13 @@ def schedule_meeting(text):
         conn.commit()
         meeting_id = cursor.lastrowid
         conn.close()
+
+        # Integrate with Google Calendar
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        service = build('calendar', 'v3', credentials=creds)
+        calendar_response = create_event(service, title, date, time, attendees)
         
-        return f"Meeting '{title}' scheduled on {date} at {time} with attendees: {data['attendees']}."
+        return f"Meeting '{title}' scheduled on {date} at {time} with attendees: {data['attendees']}. {calendar_response}"
     except json.JSONDecodeError:
         logger.error("Failed to decode JSON from parsed data.")
         return "Failed to parse the meeting details. No email sent."
@@ -96,9 +130,10 @@ def schedule_meeting(text):
     except Exception as e:
         logger.error(f"Error scheduling meeting: {e}")
         return f"Error scheduling meeting: {str(e)}. No email sent."
-    
+  
 @ray.remote
-def reschedule_meeting(text):
+def reschedule_meeting(text, creds):
+    """Reschedule a meeting and update the event on Google Calendar."""
     parsed = parse_natural_language(text)
     try:
         data = json.loads(parsed)
@@ -106,6 +141,7 @@ def reschedule_meeting(text):
         if intent != 'reschedule':
             logger.warning(f"Unrecognized intent: {intent}. Email will not be sent.")
             return f"Intent '{intent}' not recognized for rescheduling. No email sent."
+        
         meeting_id = data['meeting_id']
         new_date = data.get('new_date')
         new_time = data.get('new_time')
@@ -120,7 +156,7 @@ def reschedule_meeting(text):
             logger.warning(f"Meeting with ID {meeting_id} does not exist.")
             return f"Meeting with ID {meeting_id} does not exist. No email sent."
         
-        # Update the meeting
+        # Update the meeting in the database
         cursor.execute('''
             UPDATE meetings
             SET date = ?, time = ?, status = 'rescheduled'
@@ -128,17 +164,36 @@ def reschedule_meeting(text):
         ''', (new_date, new_time, meeting_id))
         conn.commit()
         conn.close()
+
+        # Reschedule the event on Google Calendar
+        event_id = meeting[0]  # Assuming the event ID in Google Calendar is the same as the meeting ID
+        event_result = update_google_calendar_event(creds, event_id, new_date, new_time)
         
-        return f"Meeting {meeting_id} rescheduled to {new_date} at {new_time}."
-    except json.JSONDecodeError:
-        logger.error("Failed to decode JSON from parsed data.")
-        return "Failed to parse the rescheduling details. No email sent."
-    except KeyError as e:
-        logger.error(f"Missing key in parsed data: {e}")
-        return f"Missing key in parsed data: {e}. No email sent."
+        if event_result:
+            return f"Meeting {meeting_id} rescheduled to {new_date} at {new_time}."
+        else:
+            return "Failed to reschedule Google Calendar event."
+
     except Exception as e:
         logger.error(f"Error rescheduling meeting: {e}")
         return f"Error rescheduling meeting: {str(e)}. No email sent."
+
+def update_google_calendar_event(creds, event_id, new_date, new_time):
+    """Update an existing event in Google Calendar."""
+    try:
+        service = build('calendar', 'v3', credentials=creds)
+        event = service.events().get(calendarId='primary', eventId=event_id).execute()
+
+        # Update event time
+        event['start']['dateTime'] = f'{new_date}T{new_time}:00'
+        event['end']['dateTime'] = f'{new_date}T{int(new_time[:2]) + 1}:{new_time[3:]}:00'
+
+        updated_event = service.events().update(calendarId='primary', eventId=event_id, body=event).execute()
+        logger.info(f"Event updated: {updated_event['summary']}")
+        return updated_event
+    except HttpError as error:
+        logger.error(f"Error updating event: {error}")
+        return None
 
 @ray.remote
 def resolve_conflict(meeting_id, proposed_date, proposed_time):
@@ -339,3 +394,27 @@ def process_email(service, msg_id):
         logger.info(response_message)
     except Exception as e:
         logger.error(f"Error processing email: {e}")
+
+def create_event(service, title, date, time, attendees):
+    try:
+        start_datetime = f"{date}T{time}:00"
+        end_datetime = (datetime.strptime(start_datetime, "%Y-%m-%dT%H:%M:%S") + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
+        
+        event = {
+            'summary': title,
+            'start': {
+                'dateTime': start_datetime,
+                'timeZone': 'UTC',
+            },
+            'end': {
+                'dateTime': end_datetime,
+                'timeZone': 'UTC',
+            },
+            'attendees': [{'email': attendee.strip()} for attendee in attendees.split(',')],
+        }
+        created_event = service.events().insert(calendarId='primary', body=event).execute()
+        logger.info(f"Event created: {created_event.get('htmlLink')}")
+        return f"Event created successfully: {created_event.get('htmlLink')}"
+    except HttpError as error:
+        logger.error(f"An error occurred while creating the event: {error}")
+        return "Failed to create the event in Google Calendar."

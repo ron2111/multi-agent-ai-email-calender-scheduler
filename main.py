@@ -1,6 +1,8 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import ray
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
 from agents import (
     schedule_meeting,
     reschedule_meeting,
@@ -27,8 +29,10 @@ logger = logging.getLogger(__name__)
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
     'https://www.googleapis.com/auth/gmail.send',
-    'https://www.googleapis.com/auth/gmail.modify'
+    'https://www.googleapis.com/auth/gmail.modify',
+    'https://www.googleapis.com/auth/calendar'
 ]
+
 
 
 # Initialize Ray once
@@ -149,8 +153,10 @@ def email_processing_loop():
         time.sleep(300)  # Wait for 5 minutes
 
 @app.on_event("startup")
+@app.on_event("startup")
 def startup_event():
     """Start background thread for email listener."""
+    global LATEST_HISTORY_ID
     try:
         creds = None
         if os.path.exists('token.json'):
@@ -158,16 +164,22 @@ def startup_event():
         if not creds or not creds.valid:
             raise ValueError("Invalid Gmail credentials.")
         
-        service = build('gmail', 'v1', credentials=creds)
-        initialize_history_id(service)
+        # Initialize Gmail and Google Calendar services
+        gmail_service = build('gmail', 'v1', credentials=creds)
+        calendar_service = build('calendar', 'v3', credentials=creds)
+        
+        initialize_history_id(gmail_service)
 
+        # Background email listener
         def email_listener():
             while True:
-                fetch_new_emails(service)
+                fetch_new_emails(gmail_service)
                 time.sleep(10)  # Poll every 10 seconds
 
         listener_thread = threading.Thread(target=email_listener, daemon=True)
         listener_thread.start()
+
         logger.info("Started email listener thread.")
     except Exception as e:
         logger.error(f"Error starting email listener thread: {e}")
+
