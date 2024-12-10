@@ -39,27 +39,38 @@ SCOPES = [
     'https://www.googleapis.com/auth/calendar'
 ]
 
-def parse_natural_language(text):
+def parse_natural_language(text, sender_email):
+    current_datetime = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
     prompt = (
-        "Extract the intent and entities from the following text in JSON format:\n\n"
-        f"{text}\n\n"
+        f"Today's date and time is {current_datetime}. "
+        "Extract the intent, entities, and attendees from the following text in JSON format. "
+        "Interpret 'me' as the sender's email. Also, include a boolean field 'is_sender_required' "
+        "to indicate if the sender explicitly wants to be added to the attendees list.\n\n"
+        f"Sender Email: {sender_email}\n"
+        f"Text: {text}\n\n"
         "Example Output:\n"
-        "{\"intent\": \"schedule\", \"title\": \"Meeting\", \"date\": \"2024-12-05\", \"time\": \"15:00\", \"attendees\": [\"Alex\"]}"
+        "{\n"
+        "  \"intent\": \"schedule\", \n"
+        "  \"title\": \"Meeting\", \n"
+        "  \"date\": \"2024-12-05\", \n"
+        "  \"time\": \"15:00\", \n"
+        "  \"attendees\": [\"sender@example.com\", \"ravi@example.com\"],\n"
+        "  \"is_sender_required\": true\n"
+        "}"
     )
     try:
         response = openai.chat.completions.create(
-            model="gpt-4o",  # or "gpt-3.5-turbo"
+            model="gpt-4o",
             messages=[
-                {"role": "system", "content": "You are an assistant that extracts intents and entities from text."},
+                {"role": "system", "content": "You are an assistant that extracts intents and entities from text, ensuring attendee information is accurate."},
                 {"role": "user", "content": prompt}
             ],
             max_tokens=150,
             temperature=0.5,
         )
-        print(response)
         raw_content = response.choices[0].message.content.strip()
         if raw_content.startswith("```json") and raw_content.endswith("```"):
-            raw_content = raw_content[7:-3].strip()  
+            raw_content = raw_content[7:-3].strip()
 
         return raw_content
 
@@ -71,6 +82,10 @@ def create_google_calendar_event(creds, title, date, time, attendees):
     """Create an event in Google Calendar."""
     try:
         service = build('calendar', 'v3', credentials=creds)
+        
+        # Convert attendees set to a list of dictionaries
+        attendees_list = [{'email': attendee} for attendee in attendees]
+
         event = {
             'summary': title,
             'start': {
@@ -81,14 +96,14 @@ def create_google_calendar_event(creds, title, date, time, attendees):
                 'dateTime': f'{date}T{int(time[:2]) + 1}:{time[3:]}:00',  # End time 1 hour later
                 'timeZone': 'UTC',
             },
-            'attendees': [{'email': attendee} for attendee in attendees.split(',')],
+            'attendees': attendees_list,
         }
         event_result = service.events().insert(calendarId='primary', body=event).execute()
         logger.info(f"Event created: {event_result['summary']}")
-        return event_result
+        return f"Event created successfully: {event_result.get('htmlLink')}"
     except HttpError as error:
         logger.error(f"Error creating event: {error}")
-        return None
+        return f"Error creating the event in Google Calendar: {error}"
 
 
 def is_valid_email(email):
@@ -96,9 +111,61 @@ def is_valid_email(email):
     regex = r'^\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
     return re.match(regex, email) is not None
 
+def send_calendar_invitation(service, to_email, event, meeting_id):
+    """Send acknowledgment email with a single calendar invitation."""
+    try:
+        # Convert ISO datetime to human-readable format
+        start_time = datetime.strptime(event['start']['dateTime'], "%Y-%m-%dT%H:%M:%S")
+        end_time = datetime.strptime(event['end']['dateTime'], "%Y-%m-%dT%H:%M:%S")
+        formatted_date = start_time.strftime("%A, %B %d, %Y")
+        formatted_time = f"{start_time.strftime('%I:%M %p')} to {end_time.strftime('%I:%M %p')}"
+
+        # Email subject and body
+        subject = f"Meeting Confirmation (ID: {meeting_id}): {event['summary']}"
+        body = (
+            f"Dear {to_email},\n\n"
+            f"Your meeting '{event['summary']}' (ID: {meeting_id}) has been scheduled successfully.\n\n"
+            f"Details:\n"
+            f"Date: {formatted_date}\n"
+            f"Time: {formatted_time}\n\n"
+            "A calendar invitation has been attached for your convenience."
+        )
+
+        # Create email message
+        message = MIMEMultipart()
+        message['To'] = to_email
+        message['Subject'] = subject
+        message.attach(MIMEText(body, 'plain'))
+
+        # Create ICS data
+        ics_data = (
+            f"BEGIN:VCALENDAR\n"
+            f"VERSION:2.0\n"
+            f"BEGIN:VEVENT\n"
+            f"SUMMARY:{event['summary']}\n"
+            f"DTSTART:{start_time.strftime('%Y%m%dT%H%M%S')}\n"
+            f"DTEND:{end_time.strftime('%Y%m%dT%H%M%S')}\n"
+            f"LOCATION:Virtual\n"
+            f"DESCRIPTION:Scheduled via AI Assistant.\n"
+            f"END:VEVENT\n"
+            f"END:VCALENDAR"
+        )
+
+        # Attach ICS file
+        attachment = MIMEText(ics_data, 'calendar; method=REQUEST')
+        attachment.add_header('Content-Disposition', 'attachment', filename='invite.ics')
+        message.attach(attachment)
+
+        # Encode and send email
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        service.users().messages().send(userId='me', body={'raw': raw_message}).execute()
+        logger.info(f"Calendar invitation sent to {to_email}")
+    except Exception as e:
+        logger.error(f"Error sending calendar invitation: {e}")
+
 @ray.remote
 def schedule_meeting(text, from_email):
-    parsed = parse_natural_language(text)
+    parsed = parse_natural_language(text, from_email)
     try:
         data = json.loads(parsed)
         intent = data.get('intent', '').lower()
@@ -107,29 +174,34 @@ def schedule_meeting(text, from_email):
             return f"Intent '{intent}' not recognized for scheduling. No email sent."
 
         title = data.get('title', 'Meeting')
-        date = data['date']
-        time = data.get('time', '09:00')  # Default time if not provided
+        date = data.get('date', datetime.utcnow().strftime('%Y-%m-%d'))  # Default to today's date
+        time = data.get('time', '09:00')  # Default to 9 AM UTC
         attendees = data.get('attendees', [])
+        is_sender_required = data.get('is_sender_required', False)
 
-        # Validate and process attendee emails
-        valid_attendees = []
+        # Validate and process attendees
+        valid_attendees = set()
+        authorized_user_email = os.getenv('AUTHORIZED_USER_EMAIL', 'default_email@domain.com')
+
         for attendee in attendees:
             attendee = attendee.strip()
-            if is_valid_email(attendee):
-                valid_attendees.append(attendee)
+            if attendee.lower() == "me":
+                valid_attendees.add(authorized_user_email)  # Map "me" to authorized email
+            elif is_valid_email(attendee):
+                valid_attendees.add(attendee)
             else:
-                logger.warning(f"Invalid attendee email: {attendee}. Ignoring.")
+                logger.warning(f"Invalid attendee email or ambiguous reference: {attendee}. Ignoring.")
 
-        # If no valid attendees, use the sender's email
+        # Add the sender's email if 'is_sender_required' is true
+        if is_sender_required:
+            valid_attendees.add(from_email)
+
+        # Add the default authorized user email if no attendees are valid
         if not valid_attendees:
-            if is_valid_email(from_email):
-                valid_attendees.append(from_email)
-                logger.info(f"No valid attendees provided. Using sender's email: {from_email}")
-            else:
-                logger.error("Invalid sender email and no valid attendees provided.")
-                return "Invalid sender email and no valid attendees provided. No email sent."
+            valid_attendees.add(authorized_user_email)
+            logger.info(f"No valid attendees provided. Using default authorized user email: {authorized_user_email}")
 
-        # Insert into database
+        # Insert meeting into the database
         conn = sqlite3.connect('scheduler.db')
         cursor = conn.cursor()
         cursor.execute('''
@@ -142,10 +214,18 @@ def schedule_meeting(text, from_email):
 
         # Integrate with Google Calendar
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-        calendar_response = create_event(creds, title, date, time, valid_attendees)
+        event = {
+            "summary": title,
+            "start": {"dateTime": f"{date}T{time}:00"},
+            "end": {"dateTime": f"{date}T{int(time[:2]) + 1}:{time[3:]}:00"}
+        }
+        calendar_response = create_google_calendar_event(creds, title, date, time, valid_attendees)
 
         if "Event created successfully" in calendar_response:
-            return f"Meeting '{title}' scheduled on {date} at {time} with attendees: {valid_attendees}. {calendar_response}"
+            # Send acknowledgment email
+            service = build('gmail', 'v1', credentials=creds)
+            send_calendar_invitation(service, from_email, event, meeting_id)
+            return f"Meeting '{title}' scheduled on {date} at {time} with attendees: {list(valid_attendees)}. {calendar_response}"
         else:
             return f"Meeting '{title}' scheduled locally but failed to create in Google Calendar: {calendar_response}"
 
@@ -223,27 +303,47 @@ def update_google_calendar_event(creds, event_id, new_date, new_time):
         logger.error(f"Error updating event: {error}")
         return None
 
+def notify_conflict(service, to_email, proposed_time):
+    """Notify the sender about a scheduling conflict and propose an alternative time."""
+    try:
+        message = MIMEMultipart()
+        message['To'] = to_email
+        message['Subject'] = "Meeting Scheduling Conflict"
+
+        body = (
+            f"Dear {to_email},\n\n"
+            f"There was a conflict scheduling your meeting. The proposed time is unavailable.\n"
+            f"Suggested Alternative: {proposed_time}\n\n"
+            "Please let us know if this works for you or propose another time."
+        )
+        message.attach(MIMEText(body, 'plain'))
+
+        raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        service.users().messages().send(userId='me', body={'raw': raw_message}).execute()
+        logger.info(f"Conflict notification sent to {to_email}")
+    except Exception as e:
+        logger.error(f"Error sending conflict notification: {e}")
+
 @ray.remote
-def resolve_conflict(meeting_id, proposed_date, proposed_time):
+def resolve_conflict(meeting_id, proposed_date, proposed_time, from_email):
     try:
         conn = sqlite3.connect('scheduler.db')
         cursor = conn.cursor()
-        
+
         # Check for conflicts
         cursor.execute('''
             SELECT * FROM meetings
             WHERE date = ? AND time = ? AND status = 'scheduled' AND id != ?
         ''', (proposed_date, proposed_time, meeting_id))
         conflicts = cursor.fetchall()
-        
+
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+        service = build('gmail', 'v1', credentials=creds)
+
         if conflicts:
-            # Propose next available time slot (e.g., +1 hour)
             new_time_dt = datetime.strptime(proposed_time, "%H:%M") + timedelta(hours=1)
-            if new_time_dt.hour >= 24:
-                conn.close()
-                return "No available time slots."
             proposed_time_new = new_time_dt.strftime("%H:%M")
-            conn.close()
+            notify_conflict(service, from_email, proposed_time_new)
             return f"Conflict detected. Proposed alternative time: {proposed_time_new}."
         else:
             # No conflict, schedule the meeting
