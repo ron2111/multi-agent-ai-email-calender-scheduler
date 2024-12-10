@@ -37,6 +37,14 @@ def init_db():
     );
     ''')
     
+    # Create processed_emails table
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS processed_emails (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        msg_id TEXT UNIQUE NOT NULL
+    );
+    ''')
+
     conn.commit()
     conn.close()
     print("Database initialized successfully.")

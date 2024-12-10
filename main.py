@@ -17,14 +17,12 @@ import asyncio
 import threading
 import time
 import logging
-import os  # Missing import added
-from googleapiclient.discovery import build
-from google.oauth2.credentials import Credentials
+import os
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 SCOPES = [
     'https://www.googleapis.com/auth/gmail.readonly',
@@ -32,8 +30,6 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.modify',
     'https://www.googleapis.com/auth/calendar'
 ]
-
-
 
 # Initialize Ray once
 if not ray.is_initialized():
@@ -60,7 +56,9 @@ class FeedbackRequest(BaseModel):
 
 @app.post("/schedule")
 async def schedule(request: ScheduleRequest):
-    result = await schedule_meeting.remote(request.text)
+    
+    from_email = "sender@example.com"  
+    result = await schedule_meeting.remote(request.text, from_email)
     return {"message": result}
 
 @app.post("/reschedule")
@@ -140,7 +138,6 @@ def get_meeting_details(meeting_id: int):
         logger.error(f"Error fetching meeting details: {e}")
         raise HTTPException(status_code=500, detail="Error fetching meeting details.")
 
-
 # Background Email Processing
 def email_processing_loop():
     """Loop to process emails every 5 minutes."""
@@ -153,7 +150,6 @@ def email_processing_loop():
         time.sleep(300)  # Wait for 5 minutes
 
 @app.on_event("startup")
-@app.on_event("startup")
 def startup_event():
     """Start background thread for email listener."""
     global LATEST_HISTORY_ID
@@ -163,23 +159,29 @@ def startup_event():
             creds = Credentials.from_authorized_user_file('token.json', SCOPES)
         if not creds or not creds.valid:
             raise ValueError("Invalid Gmail credentials.")
-        
-        # Initialize Gmail and Google Calendar services
+
+        # Initialize Gmail service
         gmail_service = build('gmail', 'v1', credentials=creds)
-        calendar_service = build('calendar', 'v3', credentials=creds)
-        
+
+        # Initialize History ID
         initialize_history_id(gmail_service)
 
         # Background email listener
         def email_listener():
             while True:
-                fetch_new_emails(gmail_service)
+                try:
+                    fetch_new_emails(gmail_service)
+                except Exception as e:
+                    logger.error(f"Error in email_listener: {e}")
                 time.sleep(10)  # Poll every 10 seconds
 
         listener_thread = threading.Thread(target=email_listener, daemon=True)
         listener_thread.start()
 
-        logger.info("Started email listener thread.")
+        # Start the periodic email processing loop in another thread
+        processing_thread = threading.Thread(target=email_processing_loop, daemon=True)
+        processing_thread.start()
+
+        logger.info("Started email listener and processing threads.")
     except Exception as e:
         logger.error(f"Error starting email listener thread: {e}")
-

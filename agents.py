@@ -14,6 +14,7 @@ import logging
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
+import re
 # agents.py
 
 from googleapiclient.discovery import build
@@ -89,8 +90,14 @@ def create_google_calendar_event(creds, title, date, time, attendees):
         logger.error(f"Error creating event: {error}")
         return None
 
+
+def is_valid_email(email):
+    """Simple regex check for valid email."""
+    regex = r'^\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'
+    return re.match(regex, email) is not None
+
 @ray.remote
-def schedule_meeting(text):
+def schedule_meeting(text, from_email):
     parsed = parse_natural_language(text)
     try:
         data = json.loads(parsed)
@@ -98,29 +105,50 @@ def schedule_meeting(text):
         if intent != 'schedule':
             logger.warning(f"Unrecognized intent: {intent}. Email will not be sent.")
             return f"Intent '{intent}' not recognized for scheduling. No email sent."
-        
+
         title = data.get('title', 'Meeting')
         date = data['date']
-        time = data['time']
-        attendees = ', '.join(data['attendees'])
-        
+        time = data.get('time', '09:00')  # Default time if not provided
+        attendees = data.get('attendees', [])
+
+        # Validate and process attendee emails
+        valid_attendees = []
+        for attendee in attendees:
+            attendee = attendee.strip()
+            if is_valid_email(attendee):
+                valid_attendees.append(attendee)
+            else:
+                logger.warning(f"Invalid attendee email: {attendee}. Ignoring.")
+
+        # If no valid attendees, use the sender's email
+        if not valid_attendees:
+            if is_valid_email(from_email):
+                valid_attendees.append(from_email)
+                logger.info(f"No valid attendees provided. Using sender's email: {from_email}")
+            else:
+                logger.error("Invalid sender email and no valid attendees provided.")
+                return "Invalid sender email and no valid attendees provided. No email sent."
+
         # Insert into database
         conn = sqlite3.connect('scheduler.db')
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO meetings (title, date, time, attendees, status)
             VALUES (?, ?, ?, ?, 'scheduled')
-        ''', (title, date, time, attendees))
+        ''', (title, date, time, ','.join(valid_attendees)))
         conn.commit()
         meeting_id = cursor.lastrowid
         conn.close()
 
         # Integrate with Google Calendar
         creds = Credentials.from_authorized_user_file('token.json', SCOPES)
-        service = build('calendar', 'v3', credentials=creds)
-        calendar_response = create_event(service, title, date, time, attendees)
-        
-        return f"Meeting '{title}' scheduled on {date} at {time} with attendees: {data['attendees']}. {calendar_response}"
+        calendar_response = create_event(creds, title, date, time, valid_attendees)
+
+        if "Event created successfully" in calendar_response:
+            return f"Meeting '{title}' scheduled on {date} at {time} with attendees: {valid_attendees}. {calendar_response}"
+        else:
+            return f"Meeting '{title}' scheduled locally but failed to create in Google Calendar: {calendar_response}"
+
     except json.JSONDecodeError:
         logger.error("Failed to decode JSON from parsed data.")
         return "Failed to parse the meeting details. No email sent."
@@ -130,7 +158,7 @@ def schedule_meeting(text):
     except Exception as e:
         logger.error(f"Error scheduling meeting: {e}")
         return f"Error scheduling meeting: {str(e)}. No email sent."
-  
+
 @ray.remote
 def reschedule_meeting(text, creds):
     """Reschedule a meeting and update the event on Google Calendar."""
@@ -327,13 +355,13 @@ def initialize_history_id(service):
     """Initialize the history ID when the server starts."""
     global LATEST_HISTORY_ID
     try:
-        # Get the most recent history ID
+        # Get the current profile's history ID
         profile = service.users().getProfile(userId='me').execute()
-        history = service.users().history().list(userId='me', startHistoryId=profile['historyId']).execute()
-        LATEST_HISTORY_ID = profile['historyId']
+        LATEST_HISTORY_ID = profile.get('historyId')
         logger.info(f"Initialized latest history ID: {LATEST_HISTORY_ID}")
     except Exception as e:
         logger.error(f"Error initializing history ID: {e}")
+
 
 def fetch_new_emails(service):
     """Fetch new emails using Gmail history API."""
@@ -364,11 +392,23 @@ def fetch_new_emails(service):
 def process_email(service, msg_id):
     """Process a single email by ID."""
     try:
+        # Check if the message has already been processed
+        conn = sqlite3.connect('scheduler.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM processed_emails WHERE msg_id = ?', (msg_id,))
+        if cursor.fetchone():
+            logger.info(f"Email {msg_id} has already been processed. Skipping.")
+            conn.close()
+            return
+
         message = service.users().messages().get(userId='me', id=msg_id, format='full').execute()
         payload = message.get('payload', {})
         headers = payload.get('headers', [])
         subject = next((h['value'] for h in headers if h['name'].lower() == 'subject'), "")
         from_email = next((h['value'] for h in headers if h['name'].lower() == 'from'), "")
+        # Extract the email address from the 'From' header
+        from_email = re.search(r'<(.+?)>', from_email)
+        from_email = from_email.group(1) if from_email else from_email
 
         # Extract the email body
         body = ""
@@ -389,17 +429,25 @@ def process_email(service, msg_id):
             body = "No content found in the email body."
 
         logger.info(f"Processing email from {from_email} with subject '{subject}'.")
-        response_message = ray.get(schedule_meeting.remote(body))
+        response_message = ray.get(schedule_meeting.remote(body, from_email))
 
         logger.info(response_message)
+
+        # Mark the email as processed
+        cursor.execute('INSERT INTO processed_emails (msg_id) VALUES (?)', (msg_id,))
+        conn.commit()
+        conn.close()
+
     except Exception as e:
         logger.error(f"Error processing email: {e}")
 
-def create_event(service, title, date, time, attendees):
+def create_event(creds, title, date, time, attendees):
     try:
+        service = build('calendar', 'v3', credentials=creds)
         start_datetime = f"{date}T{time}:00"
-        end_datetime = (datetime.strptime(start_datetime, "%Y-%m-%dT%H:%M:%S") + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%S")
-        
+        end_time = (datetime.strptime(start_datetime, "%Y-%m-%dT%H:%M:%S") + timedelta(hours=1)).strftime("%H:%M:%S")
+        end_datetime = f"{date}T{end_time}"
+
         event = {
             'summary': title,
             'start': {
@@ -410,11 +458,12 @@ def create_event(service, title, date, time, attendees):
                 'dateTime': end_datetime,
                 'timeZone': 'UTC',
             },
-            'attendees': [{'email': attendee.strip()} for attendee in attendees.split(',')],
+            'attendees': [{'email': attendee} for attendee in attendees],
         }
         created_event = service.events().insert(calendarId='primary', body=event).execute()
         logger.info(f"Event created: {created_event.get('htmlLink')}")
         return f"Event created successfully: {created_event.get('htmlLink')}"
     except HttpError as error:
-        logger.error(f"An error occurred while creating the event: {error}")
-        return "Failed to create the event in Google Calendar."
+        error_content = error.content.decode() if hasattr(error, 'content') else str(error)
+        logger.error(f"An error occurred while creating the event: {error_content}")
+        return f"Failed to create the event in Google Calendar. Error: {error_content}"
